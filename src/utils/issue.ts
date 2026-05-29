@@ -6,6 +6,49 @@ import { AssignedIssueScope, Role } from "../types/plugin-input";
 import { getOpenLinkedPullRequestsForIssue, GetLinkedResults } from "./get-linked-prs";
 import { getAllPullRequestsFallback, getAssignedIssuesFallback } from "./get-pull-requests-fallback";
 
+const QUERY_PULL_REQUEST_REVIEW_THREADS = /* GraphQL */ `
+  query pullRequestReviewThreads($owner: String!, $repo: String!, $pull_number: Int!, $cursor: String) {
+    repository(owner: $owner, name: $repo) {
+      pullRequest(number: $pull_number) {
+        reviewThreads(first: 100, after: $cursor) {
+          nodes {
+            isResolved
+            comments(first: 100) {
+              nodes {
+                author {
+                  login
+                }
+                createdAt
+              }
+            }
+          }
+          pageInfo {
+            hasNextPage
+            endCursor
+          }
+        }
+      }
+    }
+  }
+`;
+
+type PullRequestReviewThread = {
+  isResolved?: boolean | null;
+  comments?: {
+    nodes?: ({ author?: { login?: string | null } | null; createdAt?: string | null } | null)[] | null;
+  } | null;
+};
+
+type PullRequestReviewThreadsResponse = {
+  repository?: {
+    pullRequest?: {
+      reviewThreads?: {
+        nodes?: (PullRequestReviewThread | null)[] | null;
+      } | null;
+    } | null;
+  } | null;
+};
+
 export function isParentIssue(body: string) {
   const parentPattern = /-\s+\[( |x)\]\s+#\d+/;
   return body.match(parentPattern);
@@ -240,12 +283,13 @@ async function getReviewByUser(context: Context, pullRequest: Awaited<ReturnType
   return latestReviewsByUser;
 }
 
-async function shouldSkipPullRequest(
+async function shouldOffsetAssignedIssueLimit(
   context: Context,
   pullRequest: Awaited<ReturnType<typeof getOpenedPullRequestsForUser>>[0],
   reviews: Awaited<ReturnType<typeof getReviewByUser>>,
   { owner, repo, issueNumber }: { owner: string; repo: string; issueNumber: number },
-  reviewDelayTolerance: string
+  reviewDelayTolerance: string,
+  username: string
 ) {
   const timeline = await context.octokit.paginate(context.octokit.rest.issues.listEventsForTimeline, {
     owner,
@@ -254,26 +298,23 @@ async function shouldSkipPullRequest(
   });
   const reviewEvent = timeline.filter((o) => o.event === "review_requested").pop();
   const referenceTime = reviewEvent && "created_at" in reviewEvent ? new Date(reviewEvent.created_at).getTime() : new Date(pullRequest.created_at).getTime();
+  const isDelayExceeded = new Date().getTime() - referenceTime >= getTimeValue(reviewDelayTolerance);
+  const unresolvedReviewThreads = await getUnresolvedReviewThreads(context, owner, repo, issueNumber);
 
-  // If no reviews exist, check time reference
+  if (unresolvedReviewThreads.length > 0) {
+    return areReviewThreadsWaitingOnReviewer(unresolvedReviewThreads, username, reviewDelayTolerance);
+  }
+
+  // PRs with no review activity after the configured tolerance offset the active assignment count.
   if (reviews.size === 0) {
-    return new Date().getTime() - referenceTime >= getTimeValue(reviewDelayTolerance);
+    return isDelayExceeded;
   }
 
-  // If changes are requested, do not skip
-  if (Array.from(reviews.values()).some((review) => review.state === "CHANGES_REQUESTED")) {
-    return true;
-  }
-
-  // If no approvals exist or time reference has exceeded review delay tolerance
-  const hasApproval = Array.from(reviews.values()).some((review) => review.state === "APPROVED");
-  const isTimePassed = new Date().getTime() - referenceTime >= getTimeValue(reviewDelayTolerance);
-
-  return hasApproval || !isTimePassed;
+  return false;
 }
 
 /**
- * Returns all the pull-requests pending approval, which count negatively against the PR author's quota.
+ * Returns open pull requests that offset assigned issue count because the assignee is waiting on reviewer action.
  */
 export async function getPendingOpenedPullRequests(context: Context, username: string) {
   const { reviewDelayTolerance } = context.config;
@@ -287,19 +328,57 @@ export async function getPendingOpenedPullRequests(context: Context, username: s
     if (!openedPullRequest) continue;
     const { owner, repo } = getOwnerRepoFromHtmlUrl(openedPullRequest.html_url);
     const latestReviewsByUser = await getReviewByUser(context, openedPullRequest);
-    const shouldSkipPr = await shouldSkipPullRequest(
+    const shouldOffsetLimit = await shouldOffsetAssignedIssueLimit(
       context,
       openedPullRequest,
       latestReviewsByUser,
       { owner, repo, issueNumber: openedPullRequest.number },
-      reviewDelayTolerance
+      reviewDelayTolerance,
+      username
     );
-    if (!shouldSkipPr) {
+    if (shouldOffsetLimit) {
       result.push(openedPullRequest);
     }
   }
 
   return result;
+}
+
+async function getUnresolvedReviewThreads(context: Context, owner: string, repo: string, pullNumber: number): Promise<PullRequestReviewThread[]> {
+  if (!("graphql" in context.octokit) || typeof context.octokit.graphql?.paginate !== "function") {
+    return [];
+  }
+
+  try {
+    const response = await context.octokit.graphql.paginate<PullRequestReviewThreadsResponse>(QUERY_PULL_REQUEST_REVIEW_THREADS, {
+      owner,
+      repo,
+      pull_number: pullNumber,
+    });
+    return response.repository?.pullRequest?.reviewThreads?.nodes?.filter((thread): thread is PullRequestReviewThread => !!thread && !thread.isResolved) ?? [];
+  } catch (err) {
+    context.logger.debug("Fetching pull request review threads failed", { error: err as Error, owner, repo, pullNumber });
+    return [];
+  }
+}
+
+function areReviewThreadsWaitingOnReviewer(reviewThreads: PullRequestReviewThread[], username: string, reviewDelayTolerance: string) {
+  const delay = getTimeValue(reviewDelayTolerance);
+  return reviewThreads.every((thread) => {
+    const latestComment = thread.comments?.nodes
+      ?.filter((comment): comment is NonNullable<typeof comment> => !!comment?.createdAt)
+      .sort((a, b) => new Date(b.createdAt ?? "").getTime() - new Date(a.createdAt ?? "").getTime())[0];
+
+    if (!latestComment?.author?.login || !latestComment.createdAt) {
+      return false;
+    }
+
+    const latestCommentAuthor = latestComment.author.login.toLowerCase();
+    const isUserWaiting = latestCommentAuthor === username.toLowerCase();
+    const isDelayExceeded = new Date().getTime() - new Date(latestComment.createdAt).getTime() >= delay;
+
+    return isUserWaiting && isDelayExceeded;
+  });
 }
 
 export function getTimeValue(timeString: string): number {

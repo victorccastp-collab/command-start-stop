@@ -33,7 +33,8 @@ export async function handleTaskLimitChecks({
 
   const { limit, role } = roleAndLimit || (await getUserRoleAndTaskLimit(context, username));
 
-  const isWithinLimit = Math.abs(assignedIssues.length - openedPullRequests.length) < limit;
+  const effectiveAssignedIssueCount = Math.max(assignedIssues.length - openedPullRequests.length, 0);
+  const isWithinLimit = effectiveAssignedIssueCount < limit;
 
   // Check for unassignment first - this should take precedence over task limit
   if (await hasUserBeenUnassigned(context, username)) {
@@ -53,6 +54,7 @@ export async function handleTaskLimitChecks({
     logger.warn(errorMessage, {
       assignedIssues: assignedIssues.length,
       openedPullRequests: openedPullRequests.length,
+      effectiveAssignedIssueCount,
       limit,
     });
   }
